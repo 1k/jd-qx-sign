@@ -14,6 +14,8 @@
  *
  * [mitm]
  * hostname = api.m.jd.com, me-api.jd.com
+ *
+ * v1.1：存储改用 QX 官方 $prefs（QX 无 $persistentStore，那是 Surge/Loon 的 API）
  */
 
 var KEY = 'JD_QX_COOKIE'
@@ -22,6 +24,19 @@ var RETRY = 3 // 被限流(S109)时的自动重试次数
 // ---------- 基础工具 ----------
 function log(m) { console.log(m) }
 function notify(t, s, b) { $notify(t, s, b || '') }
+
+// 持久化存储：QX 官方 API 是 $prefs（valueForKey / setValueForKey，注意 value 在前、key 在后）
+// $persistentStore 是 Surge/Loon 的 API，QX 里不存在，这里仅作跨平台兜底
+function storeRead(k) {
+  try { if (typeof $prefs !== 'undefined' && $prefs.valueForKey) return $prefs.valueForKey(k) } catch (e) {}
+  try { if (typeof $persistentStore !== 'undefined') return $persistentStore.read(k) } catch (e) {}
+  return null
+}
+function storeWrite(v, k) {
+  try { if (typeof $prefs !== 'undefined' && $prefs.setValueForKey) return $prefs.setValueForKey(v, k) } catch (e) {}
+  try { if (typeof $persistentStore !== 'undefined') return $persistentStore.write(v, k) } catch (e) {}
+  return false
+}
 
 function randHex(n) {
   var c = '0123456789abcdef', s = ''
@@ -146,7 +161,7 @@ function trySign(cookie, n, last) {
 
 // ---------- 定时任务模式 ----------
 function taskMain() {
-  var cookie = $persistentStore.read(KEY)
+  var cookie = storeRead(KEY)
   if (!cookie || cookie.indexOf('pt_key=') === -1) {
     notify('京东签到 ❌', '未找到 Cookie', '请先打开京东 App 到「我的」页面，自动获取 Cookie')
     return $done()
@@ -191,14 +206,18 @@ if (typeof $request !== 'undefined') {
     var h = $request.headers || {}
     var ck = h['Cookie'] || h['cookie'] || ''
     if (ck.indexOf('pt_key=') > -1 && ck.indexOf('pt_pin=') > -1) {
-      var old = $persistentStore.read(KEY)
+      var old = storeRead(KEY)
       if (old === ck) {
         log('Cookie 未变化，跳过')
-      } else if ($persistentStore.write(ck, KEY)) {
+      } else if (storeWrite(ck, KEY)) {
         notify('京东 Cookie', '✅ 已获取：' + getPin(ck), '可到「定时任务」手动运行一次签到测试')
+      } else {
+        notify('京东 Cookie', '⚠️ 已抓到但保存失败', '请重试或反馈日志')
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    log('Cookie 抓取异常：' + e)
+  }
   $done({})
 } else {
   taskMain()
