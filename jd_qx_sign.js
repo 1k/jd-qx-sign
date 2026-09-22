@@ -17,6 +17,8 @@
  *
  * v1.1：存储改用 QX 官方 $prefs（QX 无 $persistentStore，那是 Surge/Loon 的 API）
  * v1.2：签到结果必写日志（不依赖通知）；25 秒看门狗防请求挂起静默无结果
+ * v1.3：签到改走已验证的 signed_wh5_ihub H5 入口（真实 App 请求形状+完整头），
+ *       修复 code=402「挤不进去」；402/S109 均自动重试（间隔 5 秒），看门狗放宽到 90 秒
  */
 
 var KEY = 'JD_QX_COOKIE'
@@ -83,6 +85,13 @@ function http(opts) {
 }
 
 // ---------- 京东接口 ----------
+// 签到请求形状：沿用社区已验证的真实 App 请求（signed_wh5_ihub H5 入口），
+// 旧的 appid=ld + 假指纹 body 会被活动网关弹回 code=402「挤不进去」
+var SIGN_URL = 'https://api.m.jd.com/client.action?functionId=signBeanAct'
+var SIGN_BODY = 'functionId=signBeanAct&body=%7B%7D&appid=signed_wh5_ihub&client=apple&screen=430*749&networkType=wifi&openudid=79e7a95afb54c4997187d2a1c105b408ebe5aebd&uuid=79e7a95afb54c4997187d2a1c105b408ebe5aebd&clientVersion=15.1.65&d_model=iPhone16%2C2&osVersion=18.5'
+var SIGN_UA = 'jdapp;iPhone;15.1.65;;;M/5.0;appBuild/169923;jdSupportDarkMode/1;lang/zh_CN;site/CN;elder/0;ef/1;ep/%7B%22ciphertype%22%3A5%2C%22cipher%22%3A%7B%22ud%22%3A%22DzvvD2O5DWPwYtU0YzG5EJcnENduCwOnYzOmDWS0CNrvYwU1YWVsZK%3D%3D%22%2C%22sv%22%3A%22CJqkDG%3D%3D%22%2C%22iad%22%3A%22%22%7D%2C%22ts%22%3A1751935372%2C%22hdid%22%3A%22JM9F1ywUPwflvMIpYPok0tt5k9kW4ArJEU3lfLhxBqw%3D%22%2C%22version%22%3A%221.0.3%22%2C%22appname%22%3A%22com.360buy.jdmobile%22%2C%22ridx%22%3A-1%7D;Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148;supportJDSHWK/1;'
+var SIGN_PAGE = 'https://pro.m.jd.com/mall/active/Md9FMi1pJXg2q7qc8CmE9FNYDS4/index.html'
+
 // 查询当前京豆总数（失败返回 -1）
 function queryBeans(cookie) {
   var c = buildClient()
@@ -101,13 +110,24 @@ function queryBeans(cookie) {
   }, function () { return -1 })
 }
 
-// 执行签到，state: ok / unknown / blocked(限流) / fail
+// 执行签到，state: ok / unknown / blocked(拦截) / fail
 function doSign(cookie) {
-  var c = buildClient()
   return http({
-    url: c.url,
+    url: SIGN_URL,
     method: 'POST',
-    headers: { 'Cookie': cookie, 'User-Agent': c.ua, 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+    headers: {
+      'Cookie': cookie,
+      'User-Agent': SIGN_UA,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Origin': 'https://pro.m.jd.com',
+      'Referer': SIGN_PAGE,
+      'x-referer-page': SIGN_PAGE,
+      'x-rp-client': 'h5_1.0.0',
+      'request-from': 'native',
+      'Accept': '*/*',
+      'Accept-Language': 'zh-CN,zh-Hans;q=0.9'
+    },
+    body: SIGN_BODY,
     timeout: 15000
   }).then(function (resp) {
     if (resp.statusCode !== 200) return { state: 'fail', msg: '请求失败 HTTP ' + resp.statusCode, beans: 0 }
@@ -119,27 +139,29 @@ function doSign(cookie) {
     if (code === '3' || code === '13' || raw.indexOf('登录') > -1 || raw.indexOf('pt_key') > -1) {
       return { state: 'fail', msg: 'Cookie 已失效，请打开京东 App「我的」页重新获取', beans: 0 }
     }
-    if (code !== '0') return { state: 'fail', msg: 'code=' + code + ' ' + (data.msg || data.message || ''), beans: 0 }
-    var errCode = '', errMsg = ''
-    try { errCode = String(data.errorCode || '') } catch (e) {}
-    try { errMsg = String(data.errorMessage || '') } catch (e) {}
-    if (errCode === 'S109' || errMsg.indexOf('稍晚') > -1 || errMsg.indexOf('人数较多') > -1) {
-      return { state: 'blocked', msg: '被限流(' + (errCode || 'S109') + ')', beans: 0 }
+    var msg = ''
+    try { msg = String(data.errorMessage || data.message || data.msg || '') } catch (e) {}
+    if (code === '402' || msg.indexOf('挤不进去') > -1 || msg.indexOf('稍晚') > -1 || msg.indexOf('人数较多') > -1) {
+      return { state: 'blocked', msg: '被拦截(' + code + ' ' + msg + ')', beans: 0 }
     }
-    if (raw.indexOf('已签到') > -1) {
-      var days0 = ''
-      try { days0 = data.data.signDays } catch (e) {}
-      if (!days0) { var m0 = raw.match(/"signDays"\s*:\s*(\d+)/); if (m0) days0 = m0[1] }
-      return { state: 'ok', msg: '今日已签到' + (days0 ? '，连续 ' + days0 + ' 天' : ''), beans: 0 }
-    }
+    if (code !== '0') return { state: 'fail', msg: 'code=' + code + ' ' + msg, beans: 0 }
+    // code=0：status 1=本次签到成功 2=今日已签到
+    var d = (typeof data.data === 'object' && data.data) ? data.data : {}
+    var status = String(d.status || '')
+    var award = d.dailyAward || d.continuityAward || d.newUserAward || {}
     var beans = 0
-    try { beans = parseInt(data.data.dailyAward.beanAward.beanCount) || 0 } catch (e) {}
-    if (!beans) { var m = raw.match(/"bean(?:Count|Num)"\s*:\s*(\d+)/); if (m) beans = parseInt(m[1]) }
+    try { beans = parseInt(award.beanAward.beanCount) || 0 } catch (e) {}
+    if (!beans) { try { beans = parseInt(award.awardList[0].beanCount) || 0 } catch (e) {} }
+    if (!beans) { var m = raw.match(/"bean(?:Count|Num)"\s*:\s*"?(\d+)/); if (m) beans = parseInt(m[1]) }
     var days = ''
-    try { days = data.data.signDays } catch (e) {}
-    if (!days) { var m2 = raw.match(/"signDays"\s*:\s*(\d+)/); if (m2) days = m2[1] }
+    try { days = String(d.continuousDays) } catch (e) {}
+    if (!days) { var m2 = raw.match(/"continuousDays"\s*:\s*"?(\d+)/); if (m2) days = m2[1] }
+    var tail = (beans ? ' +' + beans + ' 京豆' : '') + (days ? '，连续 ' + days + ' 天' : '')
+    if (status === '1') return { state: 'ok', msg: '签到成功' + tail, beans: beans }
+    if (status === '2') return { state: 'ok', msg: '今日已签到' + tail, beans: 0 }
+    if (raw.indexOf('已签到') > -1) return { state: 'ok', msg: '今日已签到' + tail, beans: 0 }
     if (beans > 0 || raw.indexOf('签到成功') > -1 || raw.indexOf('签到奖励') > -1) {
-      return { state: 'ok', msg: '签到成功' + (beans ? ' +' + beans + ' 京豆' : '') + (days ? '，连续 ' + days + ' 天' : ''), beans: beans }
+      return { state: 'ok', msg: '签到成功' + tail, beans: beans }
     }
     return { state: 'unknown', msg: '接口正常但未检测到奖励', beans: 0 }
   }, function (err) {
@@ -148,13 +170,15 @@ function doSign(cookie) {
   })
 }
 
-// 被限流时连续重试（手机真实环境，第一次一般就能通过）
+// 被拦截时自动重试（402 挤不进去 / S109 通常稍等即可通过，间隔 5 秒）
 function trySign(cookie, n, last) {
-  if (n > RETRY) return Promise.resolve(last || { state: 'fail', msg: '重试后仍被限流', beans: 0 })
+  if (n > RETRY) return Promise.resolve(last || { state: 'fail', msg: '重试后仍被拦截', beans: 0 })
   return doSign(cookie).then(function (r) {
     if (r.state === 'blocked' && n <= RETRY) {
-      log('第 ' + n + ' 次被限流，重试…')
-      return trySign(cookie, n + 1, r)
+      log('第 ' + n + ' 次被拦，5 秒后重试…')
+      return new Promise(function (res) {
+        setTimeout(function () { res(trySign(cookie, n + 1, r)) }, 5000)
+      })
     }
     return r
   })
@@ -170,15 +194,15 @@ function taskMain() {
   var pin = getPin(cookie)
   var doneFlag = false
   function onceDone() { if (!doneFlag) { doneFlag = true; $done() } }
-  // 看门狗：25 秒未结束则记录并通知，防止请求挂起导致静默无结果
+  // 看门狗：90 秒未结束则记录并通知，防止请求挂起导致静默无结果（最长 4 次尝试+间隔约 40 秒）
   setTimeout(function () {
     if (!doneFlag) {
-      log('⚠️ 25 秒未完成，疑似签到请求挂起')
+      log('⚠️ 90 秒未完成，疑似签到请求挂起')
       notify('京东签到 ⚠️', '流程超时', '签到请求长时间无响应，脚本已中止')
       doneFlag = true
       $done()
     }
-  }, 25000)
+  }, 90000)
   var before = -1
   queryBeans(cookie).then(function (n) {
     before = n
