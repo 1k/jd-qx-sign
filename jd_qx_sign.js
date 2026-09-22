@@ -16,6 +16,7 @@
  * hostname = api.m.jd.com, me-api.jd.com
  *
  * v1.1：存储改用 QX 官方 $prefs（QX 无 $persistentStore，那是 Surge/Loon 的 API）
+ * v1.2：签到结果必写日志（不依赖通知）；25 秒看门狗防请求挂起静默无结果
  */
 
 var KEY = 'JD_QX_COOKIE'
@@ -167,12 +168,25 @@ function taskMain() {
     return $done()
   }
   var pin = getPin(cookie)
+  var doneFlag = false
+  function onceDone() { if (!doneFlag) { doneFlag = true; $done() } }
+  // 看门狗：25 秒未结束则记录并通知，防止请求挂起导致静默无结果
+  setTimeout(function () {
+    if (!doneFlag) {
+      log('⚠️ 25 秒未完成，疑似签到请求挂起')
+      notify('京东签到 ⚠️', '流程超时', '签到请求长时间无响应，脚本已中止')
+      doneFlag = true
+      $done()
+    }
+  }, 25000)
   var before = -1
   queryBeans(cookie).then(function (n) {
     before = n
     log(pin + ' 签到前京豆：' + before)
+    log('开始签到…')
     return trySign(cookie, 1, null)
   }).then(function (r) {
+    log(pin + ' 签到结果：[' + r.state + '] ' + r.msg)
     var gained = r.beans
     var after = -2
     var p
@@ -191,12 +205,13 @@ function taskMain() {
       if (after >= 0) extra += '，当前共 ' + after + ' 京豆'
       else if (before >= 0 && r.state !== 'ok') extra += '，签到前共 ' + before + ' 京豆'
       notify('京东签到' + (tag ? ' ' + tag : ''), pin + '：' + r.msg + extra, '')
-      $done()
+      onceDone()
     })
   }).catch(function (e) {
     var m = (e && e.message) ? e.message : String(e)
+    log('运行异常：' + m)
     notify('京东签到 ❌', '运行异常', m)
-    $done()
+    onceDone()
   })
 }
 
